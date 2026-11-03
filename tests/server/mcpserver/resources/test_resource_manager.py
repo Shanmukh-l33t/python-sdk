@@ -140,3 +140,35 @@ def test_add_template_without_metadata():
     manager = ResourceManager()
     template = manager.add_template(fn=get_item, uri_template="resource://items/{id}")
     assert template.meta is None
+
+
+def get_item_v2(id: str) -> str: ...
+
+
+def test_add_duplicate_template():
+    """Test that re-registering the same URI template keeps the first template."""
+    manager = ResourceManager()
+    first = manager.add_template(fn=get_item, uri_template="resource://items/{id}")
+    second = manager.add_template(fn=get_item_v2, uri_template="resource://items/{id}")
+    assert second is first
+    assert manager.list_templates() == [first]
+
+
+def test_warn_on_duplicate_templates(caplog: pytest.LogCaptureFixture):
+    """Test warning on duplicate templates."""
+    manager = ResourceManager()
+    manager.add_template(fn=get_item, uri_template="resource://items/{id}")
+    with caplog.at_level(logging.WARNING):
+        manager.add_template(fn=get_item_v2, uri_template="resource://items/{id}")
+    assert "Template already exists" in caplog.text
+    assert "resource://items/{id}" in caplog.text
+
+
+def test_disable_warn_on_duplicate_templates(caplog: pytest.LogCaptureFixture):
+    """Test disabling warning on duplicate templates still preserves the first."""
+    manager = ResourceManager(warn_on_duplicate_resources=False)
+    first = manager.add_template(fn=get_item, uri_template="resource://items/{id}")
+    with caplog.at_level(logging.WARNING):
+        second = manager.add_template(fn=get_item_v2, uri_template="resource://items/{id}")
+    assert "Template already exists" not in caplog.text
+    assert second is first

@@ -523,3 +523,49 @@ async def test_sse_session_cleanup_on_disconnect() -> None:
             headers={"Content-Type": "application/json"},
         )
         assert response.status_code == 404
+
+
+_LARGE_RESULT = "x" * (2 * 1024 * 1024)
+
+
+async def _handle_large_call_tool(ctx: ServerRequestContext, params: CallToolRequestParams) -> CallToolResult:
+    assert params.name == "large"
+    return CallToolResult(content=[TextContent(text=_LARGE_RESULT)])
+
+
+async def _handle_large_list_tools(ctx: ServerRequestContext, params: PaginatedRequestParams | None) -> ListToolsResult:
+    return ListToolsResult(tools=[Tool(name="large", input_schema={"type": "object"})])
+
+
+def make_large_result_app() -> Starlette:
+    """A server whose `large` tool answers with one 2 MiB text block in a single SSE event."""
+    return make_app(
+        Server("large-result", on_call_tool=_handle_large_call_tool, on_list_tools=_handle_large_list_tools)
+    )
+
+
+@pytest.mark.anyio
+async def test_configured_sse_event_limit_accepts_a_tool_result_larger_than_one_mebibyte() -> None:
+    """SDK-defined: a raised `max_sse_event_size` accepts a large tool result delivered as one SSE event."""
+    factory = in_process_client_factory(make_large_result_app())
+    async with sse_client(
+        f"{BASE_URL}/sse", httpx_client_factory=factory, max_sse_event_size=4 * 1024 * 1024
+    ) as streams:
+        async with ClientSession(*streams) as session:
+            await session.initialize()
+            result = await session.call_tool("large", {})
+
+    content = result.content[0]
+    assert isinstance(content, TextContent)
+    assert content.text == _LARGE_RESULT
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("limit", [0, -1])
+async def test_sse_client_rejects_nonpositive_sse_event_limits(limit: int) -> None:
+    """SDK-defined: a nonpositive per-event byte limit is rejected before any HTTP request is sent."""
+    factory = in_process_client_factory(make_large_result_app())
+    with pytest.raises(ValueError) as exc_info:
+        async with sse_client(f"{BASE_URL}/sse", httpx_client_factory=factory, max_sse_event_size=limit):
+            raise NotImplementedError
+    assert str(exc_info.value) == snapshot("max_sse_event_size must be positive or None")

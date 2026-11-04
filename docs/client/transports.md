@@ -138,7 +138,7 @@ The same form doubles as an embedding API: an application that constructs the se
 
 ## SSE
 
-`sse_client(url)`, from `mcp.client.sse`, is the HTTP transport that Streamable HTTP superseded. Wrap it the same way, `Client(sse_client("http://localhost:8000/sse"))`, to talk to a server that still speaks it, and don't build anything new on it.
+`sse_client(url)`, from `mcp.client.sse`, is the HTTP transport that Streamable HTTP superseded. Wrap it the same way, `Client(sse_client("http://localhost:8000/sse"))`, to talk to a server that still speaks it, and don't build anything new on it. It takes `max_sse_event_size` with the same 1 MiB default as `streamable_http_client`, for servers that still deliver a result larger than one SSE event.
 
 ## The `Transport` protocol
 
@@ -150,7 +150,7 @@ A **transport** is any async context manager that yields a `(read, write)` pair 
 
 * `Client("http://.../mcp")` (a URL) connects over Streamable HTTP, the production transport.
 * Headers, auth, proxies and timeouts belong on an `httpx2.AsyncClient` you pass to `streamable_http_client(url, http_client=...)`. There is no `headers=` keyword.
-* Use `streamable_http_client(url, max_sse_event_size=...)` to change the byte limit for each SSE event.
+* Use `streamable_http_client(url, max_sse_event_size=...)` (or `sse_client(url, max_sse_event_size=...)`) to change the byte limit for each SSE event.
 * Redirects are followed only within the URL's own origin (a trailing-slash `307`/`308`), plus `http`→`https` on the same host. Anything else fails with `Redirect to … not followed`; configure the final URL.
 * stdio is `Client(StdioServerParameters(...))`. Wrap it in `stdio_client(...)` yourself only to redirect the child's stderr.
 * The subprocess gets an allow-listed environment, not yours; `env=` adds to it.

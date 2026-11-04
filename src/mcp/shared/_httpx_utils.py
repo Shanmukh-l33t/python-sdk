@@ -7,11 +7,19 @@ from typing import Any, Protocol
 
 import httpx2
 
-__all__ = ["create_mcp_http_client", "MCP_DEFAULT_TIMEOUT", "MCP_DEFAULT_SSE_READ_TIMEOUT"]
+__all__ = [
+    "create_mcp_http_client",
+    "MCP_DEFAULT_TIMEOUT",
+    "MCP_DEFAULT_SSE_READ_TIMEOUT",
+    "DEFAULT_MAX_SSE_EVENT_SIZE",
+]
 
 # Default MCP timeout configuration
 MCP_DEFAULT_TIMEOUT = 30.0  # General operations (seconds)
 MCP_DEFAULT_SSE_READ_TIMEOUT = 300.0  # SSE streams - 5 minutes (seconds)
+
+# Maximum bytes buffered for one SSE event before httpx2 rejects it. `None` disables the limit.
+DEFAULT_MAX_SSE_EVENT_SIZE = 1024 * 1024
 
 # The headers httpx2.AsyncClient.sse() adds to an event-stream request.
 _SSE_HEADERS = {"Accept": "text/event-stream", "Cache-Control": "no-store"}
@@ -160,7 +168,7 @@ async def sse_within_origin(
     url: httpx2.URL | str,
     *,
     headers: dict[str, str] | None = None,
-    max_event_size: int | None = 1024 * 1024,
+    max_event_size: int | None = DEFAULT_MAX_SSE_EVENT_SIZE,
 ) -> AsyncGenerator[httpx2.EventSource]:
     """`client.sse(url)` with the redirect handling of `stream_within_origin`."""
     merged = httpx2.Headers(_SSE_HEADERS)

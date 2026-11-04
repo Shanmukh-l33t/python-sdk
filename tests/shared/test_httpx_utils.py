@@ -259,6 +259,43 @@ async def test_sse_within_origin_sends_event_stream_headers_and_caller_headers()
     assert seen[1]["k"] == "v"
 
 
+def _oversized_sse_response() -> httpx2.Response:
+    """A 200 event-stream response carrying one data event larger than the 1 MiB default."""
+    return httpx2.Response(
+        200,
+        headers={"content-type": "text/event-stream"},
+        text=f"data: {'x' * (2 * 1024 * 1024)}\n\n",
+    )
+
+
+async def test_sse_within_origin_default_limit_rejects_an_oversized_event() -> None:
+    """The shared 1 MiB default is unchanged: an oversized event raises `httpx2.SSEError` and is
+    never delivered truncated."""
+    client = httpx2.AsyncClient(transport=httpx2.MockTransport(lambda request: _oversized_sse_response()))
+    with pytest.raises(httpx2.SSEError):
+        async with client, sse_within_origin(client, "http://mcp.example/sse") as source:
+            events = [event.data async for event in source]  # the first event must already fail
+        pytest.fail(f"oversized event was delivered: {events!r}")
+
+
+async def test_sse_within_origin_honors_a_raised_event_limit() -> None:
+    """An explicit `max_event_size` accepts an event larger than the 1 MiB default, intact."""
+    client = httpx2.AsyncClient(transport=httpx2.MockTransport(lambda request: _oversized_sse_response()))
+    async with client:
+        async with sse_within_origin(client, "http://mcp.example/sse", max_event_size=4 * 1024 * 1024) as source:
+            events = [event.data async for event in source]
+    assert events == ["x" * (2 * 1024 * 1024)]
+
+
+async def test_sse_within_origin_none_disables_the_event_limit() -> None:
+    """`max_event_size=None` opts out of the limit entirely."""
+    client = httpx2.AsyncClient(transport=httpx2.MockTransport(lambda request: _oversized_sse_response()))
+    async with client:
+        async with sse_within_origin(client, "http://mcp.example/sse", max_event_size=None) as source:
+            events = [event.data async for event in source]
+    assert events == ["x" * (2 * 1024 * 1024)]
+
+
 async def test_auth_flow_requests_are_not_redirected():
     """Requests an httpx2 Auth flow issues while a transport request is in flight (a token refresh,
     say) inherit the per-request no-follow setting, so a redirect on them is handed back to the

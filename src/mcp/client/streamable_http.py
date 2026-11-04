@@ -34,6 +34,7 @@ from mcp.client._transport import TransportStreams
 from mcp.shared._compat import resync_tracer
 from mcp.shared._context_streams import ContextReceiveStream, ContextSendStream, create_context_streams
 from mcp.shared._httpx_utils import (
+    DEFAULT_MAX_SSE_EVENT_SIZE,
     create_mcp_http_client,
     redirect_location,
     request_within_origin,
@@ -58,7 +59,6 @@ LAST_EVENT_ID = "last-event-id"
 # Reconnection defaults
 DEFAULT_RECONNECTION_DELAY_MS = 1000  # 1 second fallback when server doesn't provide retry
 MAX_RECONNECTION_ATTEMPTS = 2  # Max retry attempts before giving up
-DEFAULT_MAX_SSE_EVENT_SIZE = 1024 * 1024
 
 
 class StreamableHTTPError(Exception):

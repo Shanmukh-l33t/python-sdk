@@ -14,6 +14,7 @@ import pytest
 from mcp_types import (
     INTERNAL_ERROR,
     INVALID_PARAMS,
+    METHOD_NOT_FOUND,
     CallToolRequestParams,
     CallToolResult,
     GetPromptRequestParams,
@@ -249,6 +250,70 @@ async def test_records_error_status_on_mcp_error(server: SrvT, spans: SpanCaptur
     assert span.attributes["error.type"] == str(exc.value.error.code)
     assert span.attributes["rpc.response.status_code"] == str(exc.value.error.code)
     assert not [e for e in span.events if e.name == "exception"]
+
+
+@pytest.mark.anyio
+async def test_method_not_found_leaves_server_span_unset_without_error_type(server: SrvT, spans: SpanCapture):
+    """An unregistered method answers `METHOD_NOT_FOUND`, a caller error the OpenTelemetry
+    semantic conventions treat as a non-error outcome: the span records the response code,
+    sets no `error.type`, and leaves the status UNSET. Regression test for #3811 (was: ERROR
+    with `error.type` set to the stringified code)."""
+    async with connected_runner(server) as (client, _):
+        spans.clear()
+        with pytest.raises(MCPError) as exc:
+            await client.send_raw_request("resources/list", None)
+        assert exc.value.error.code == METHOD_NOT_FOUND
+    [span] = [s for s in spans.finished() if s.kind == SpanKind.SERVER]
+    assert span.status.status_code == StatusCode.UNSET
+    assert span.attributes is not None
+    assert "error.type" not in span.attributes
+    assert span.attributes["rpc.response.status_code"] == str(METHOD_NOT_FOUND)
+    assert not [e for e in span.events if e.name == "exception"]
+
+
+@pytest.mark.anyio
+async def test_resource_not_found_code_leaves_server_span_unset_without_error_type(server: SrvT, spans: SpanCapture):
+    """A handler-raised `MCPError` with -32002 (resource not found) is a caller error: the span
+    records the response code only. Regression test for #3811. SDK-defined: the spec retired
+    -32002 but handlers still emit it (see tests/interaction/lowlevel/test_resources.py)."""
+
+    async def failing(ctx: Ctx, params: PaginatedRequestParams | None) -> Any:
+        raise MCPError(code=-32002, message="Resource not found")
+
+    server.add_request_handler("tools/list", PaginatedRequestParams, failing)
+    async with connected_runner(server) as (client, _):
+        spans.clear()
+        with pytest.raises(MCPError) as exc:
+            await client.send_raw_request("tools/list", None)
+        assert exc.value.error.code == -32002
+    [span] = [s for s in spans.finished() if s.kind == SpanKind.SERVER]
+    assert span.status.status_code == StatusCode.UNSET
+    assert span.attributes is not None
+    assert "error.type" not in span.attributes
+    assert span.attributes["rpc.response.status_code"] == "-32002"
+    assert not [e for e in span.events if e.name == "exception"]
+
+
+@pytest.mark.anyio
+async def test_validation_failure_leaves_server_span_unset_without_error_type(server: SrvT, spans: SpanCapture):
+    """A params-validation failure answers `INVALID_PARAMS`, a caller error the OpenTelemetry
+    semantic conventions treat as a non-error outcome: the span records the response code with
+    no `error.type` and stays UNSET, and no event leaks pydantic's client-input messages.
+    Regression test for #3811 (was: ERROR with the sanitized description)."""
+    server.add_request_handler("tools/call", CallToolRequestParams, _ok_tool)
+    async with connected_runner(server) as (client, _):
+        spans.clear()
+        with pytest.raises(MCPError) as exc:
+            await client.send_raw_request("tools/call", {"name": 123})
+        assert exc.value.error.code == INVALID_PARAMS
+    [span] = [s for s in spans.finished() if s.kind == SpanKind.SERVER]
+    assert span.status.status_code == StatusCode.UNSET
+    assert span.attributes is not None
+    assert "error.type" not in span.attributes
+    assert span.attributes["rpc.response.status_code"] == str(INVALID_PARAMS)
+    assert span.attributes["gen_ai.operation.name"] == "execute_tool"
+    assert "gen_ai.tool.name" not in span.attributes
+    assert not span.events
 
 
 @pytest.mark.anyio

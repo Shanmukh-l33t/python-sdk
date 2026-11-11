@@ -91,3 +91,36 @@ async def test_client_span_records_error_status_when_peer_answers_with_jsonrpc_e
     assert failed.attributes is not None
     assert failed.attributes["error.type"] == str(types.INVALID_PARAMS)
     assert failed.attributes["rpc.response.status_code"] == str(types.INVALID_PARAMS)
+
+
+async def test_caller_error_response_leaves_client_span_unset_without_error_type(capfire: CaptureLogfire):
+    """A peer error response carrying a caller-error code (`INVALID_PARAMS`) is a non-error
+    outcome per the OpenTelemetry semantic conventions: the client span records
+    `rpc.response.status_code`, sets no `error.type`, and leaves the status UNSET.
+    Regression test for #3811 (was: every error response marked the span ERROR)."""
+
+    async def list_prompts(
+        ctx: ServerRequestContext, params: types.PaginatedRequestParams | None
+    ) -> types.ListPromptsResult:
+        raise MCPError(types.INVALID_PARAMS, "unknown cursor")
+
+    server = Server("test", on_list_prompts=list_prompts)
+
+    async with Client(server, mode="legacy") as client:
+        with pytest.raises(MCPError) as exc_info:
+            await client.list_prompts()
+
+    assert exc_info.value.error.code == types.INVALID_PARAMS
+
+    # logfire also exports a `pending_span` marker under each span's name when it starts.
+    spans = {
+        span.name: span
+        for span in capfire.exporter.exported_spans
+        if (span.attributes or {}).get("logfire.span_type") != "pending_span"
+    }
+    failed = spans["MCP send prompts/list"]
+
+    assert failed.status.status_code == StatusCode.UNSET
+    assert failed.attributes is not None
+    assert "error.type" not in failed.attributes
+    assert failed.attributes["rpc.response.status_code"] == str(types.INVALID_PARAMS)

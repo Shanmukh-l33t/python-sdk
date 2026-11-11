@@ -237,18 +237,27 @@ async def test_extracts_trace_context_from_meta(server: SrvT, spans: SpanCapture
 
 
 @pytest.mark.anyio
-async def test_records_error_status_on_mcp_error(server: SrvT, spans: SpanCapture):
+async def test_mcp_error_with_internal_code_marks_span_failed_with_error_type(server: SrvT, spans: SpanCapture):
+    """A handler-raised `MCPError` with a non-caller code still marks the span failed, with the
+    message as the description and the code in `error.type` and `rpc.response.status_code`; the
+    caller-error carve-out covers only the codes the OpenTelemetry semantic conventions
+    classify as non-error outcomes."""
+
+    async def failing(ctx: Ctx, params: PaginatedRequestParams | None) -> Any:
+        raise MCPError(code=INTERNAL_ERROR, message="handler declared failure")
+
+    server.add_request_handler("tools/list", PaginatedRequestParams, failing)
     async with connected_runner(server) as (client, _):
         spans.clear()
         with pytest.raises(MCPError) as exc:
-            await client.send_raw_request("resources/list", None)
-        assert exc.value.error.code != 0
+            await client.send_raw_request("tools/list", None)
+        assert exc.value.error.code == INTERNAL_ERROR
     [span] = [s for s in spans.finished() if s.kind == SpanKind.SERVER]
     assert span.status.status_code == StatusCode.ERROR
-    assert span.status.description == "Method not found"
+    assert span.status.description == "handler declared failure"
     assert span.attributes is not None
-    assert span.attributes["error.type"] == str(exc.value.error.code)
-    assert span.attributes["rpc.response.status_code"] == str(exc.value.error.code)
+    assert span.attributes["error.type"] == str(INTERNAL_ERROR)
+    assert span.attributes["rpc.response.status_code"] == str(INTERNAL_ERROR)
     assert not [e for e in span.events if e.name == "exception"]
 
 
@@ -310,24 +319,6 @@ async def test_validation_failure_leaves_server_span_unset_without_error_type(se
     assert span.status.status_code == StatusCode.UNSET
     assert span.attributes is not None
     assert "error.type" not in span.attributes
-    assert span.attributes["rpc.response.status_code"] == str(INVALID_PARAMS)
-    assert span.attributes["gen_ai.operation.name"] == "execute_tool"
-    assert "gen_ai.tool.name" not in span.attributes
-    assert not span.events
-
-
-@pytest.mark.anyio
-async def test_validation_failure_sets_sanitized_status(server: SrvT, spans: SpanCapture):
-    server.add_request_handler("tools/call", CallToolRequestParams, _ok_tool)
-    async with connected_runner(server) as (client, _):
-        spans.clear()
-        with pytest.raises(MCPError):
-            await client.send_raw_request("tools/call", {"name": 123})
-    [span] = [s for s in spans.finished() if s.kind == SpanKind.SERVER]
-    assert span.status.status_code == StatusCode.ERROR
-    assert span.status.description == "Invalid request parameters"
-    assert span.attributes is not None
-    assert span.attributes["error.type"] == str(INVALID_PARAMS)
     assert span.attributes["rpc.response.status_code"] == str(INVALID_PARAMS)
     assert span.attributes["gen_ai.operation.name"] == "execute_tool"
     assert "gen_ai.tool.name" not in span.attributes

@@ -8,7 +8,7 @@ from opentelemetry.trace import StatusCode
 from mcp.client.client import Client
 from mcp.server import Server, ServerRequestContext
 from mcp.server.mcpserver import MCPServer
-from mcp.shared._otel import extract_trace_context
+from mcp.shared._otel import extract_trace_context, is_caller_error
 from mcp.shared.exceptions import MCPError
 
 pytestmark = pytest.mark.anyio
@@ -17,6 +17,19 @@ pytestmark = pytest.mark.anyio
 def test_extract_trace_context_degrades_to_no_parent_on_malformed_traceparent() -> None:
     """A non-string `traceparent` makes `extract()` raise; the helper must return `None`, not propagate."""
     assert extract_trace_context({"traceparent": 123}) is None
+
+
+def test_is_caller_error_classifies_caller_codes_and_rejects_operation_failures() -> None:
+    """The shared predicate covers the four standard JSON-RPC caller errors plus -32002 (resource
+    not found), and classifies operation failures as non-caller (OpenTelemetry semantic
+    conventions; #3811)."""
+    assert all(
+        is_caller_error(code)
+        for code in [types.PARSE_ERROR, types.INVALID_REQUEST, types.METHOD_NOT_FOUND, types.INVALID_PARAMS, -32002]
+    )
+    assert not any(
+        is_caller_error(code) for code in [types.INTERNAL_ERROR, types.CONNECTION_CLOSED, types.REQUEST_TIMEOUT, 0]
+    )
 
 
 async def test_client_and_server_spans(capfire: CaptureLogfire):
@@ -50,10 +63,12 @@ async def test_client_and_server_spans(capfire: CaptureLogfire):
     assert server_span["context"]["trace_id"] == client_span["context"]["trace_id"]
 
 
-async def test_client_span_records_error_status_when_peer_answers_with_jsonrpc_error(capfire: CaptureLogfire):
-    """A request the peer answers with a JSON-RPC error ends its client span with status ERROR, the peer's
-    message as the description, and the code in `error.type` and `rpc.response.status_code` (OpenTelemetry
-    MCP semantic conventions, client span). A request that succeeds stays UNSET.
+async def test_client_span_records_error_status_when_peer_answers_with_internal_error(capfire: CaptureLogfire):
+    """A request the peer answers with `INTERNAL_ERROR` (a non-caller code) ends its client span
+    with status ERROR, the peer's message as the description, and the code in `error.type` and
+    `rpc.response.status_code` (OpenTelemetry MCP semantic conventions, client span). A request
+    that succeeds stays UNSET; caller-error codes are the non-error carve-out covered by
+    `test_caller_error_response_leaves_client_span_unset_without_error_type`.
     """
     message = "unknown cursor"
 
@@ -65,7 +80,7 @@ async def test_client_span_records_error_status_when_peer_answers_with_jsonrpc_e
     async def list_prompts(
         ctx: ServerRequestContext, params: types.PaginatedRequestParams | None
     ) -> types.ListPromptsResult:
-        raise MCPError(types.INVALID_PARAMS, message)
+        raise MCPError(types.INTERNAL_ERROR, message)
 
     server = Server("test", on_list_tools=list_tools, on_list_prompts=list_prompts)
 
@@ -74,7 +89,7 @@ async def test_client_span_records_error_status_when_peer_answers_with_jsonrpc_e
         with pytest.raises(MCPError) as exc_info:
             await client.list_prompts()
 
-    assert exc_info.value.error.code == types.INVALID_PARAMS
+    assert exc_info.value.error.code == types.INTERNAL_ERROR
 
     # logfire also exports a `pending_span` marker under each span's name when it starts.
     spans = {
@@ -89,8 +104,8 @@ async def test_client_span_records_error_status_when_peer_answers_with_jsonrpc_e
     assert failed.status.status_code == StatusCode.ERROR
     assert failed.status.description == message
     assert failed.attributes is not None
-    assert failed.attributes["error.type"] == str(types.INVALID_PARAMS)
-    assert failed.attributes["rpc.response.status_code"] == str(types.INVALID_PARAMS)
+    assert failed.attributes["error.type"] == str(types.INTERNAL_ERROR)
+    assert failed.attributes["rpc.response.status_code"] == str(types.INTERNAL_ERROR)
 
 
 async def test_caller_error_response_leaves_client_span_unset_without_error_type(capfire: CaptureLogfire):

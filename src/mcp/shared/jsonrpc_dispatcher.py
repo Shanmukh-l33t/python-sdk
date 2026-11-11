@@ -37,7 +37,7 @@ from pydantic import ValidationError
 from typing_extensions import TypeVar
 
 from mcp.shared._compat import resync_tracer
-from mcp.shared._otel import inject_trace_context, otel_span
+from mcp.shared._otel import inject_trace_context, is_caller_error, otel_span
 from mcp.shared._request_clock import request_clock
 from mcp.shared._stream_protocols import ReadStream, WriteStream
 from mcp.shared.dispatcher import (
@@ -416,8 +416,11 @@ class JSONRPCDispatcher(Dispatcher[TransportT]):
                     outcome = await receive.receive()
                 if isinstance(outcome, ErrorData) and outcome is not _CLOSED_OUTCOME:
                     code = str(outcome.code)
-                    span.set_attributes({"error.type": code, "rpc.response.status_code": code})
-                    span.set_status(StatusCode.ERROR, outcome.message)
+                    if is_caller_error(outcome.code):
+                        span.set_attribute("rpc.response.status_code", code)
+                    else:
+                        span.set_attributes({"error.type": code, "rpc.response.status_code": code})
+                        span.set_status(StatusCode.ERROR, outcome.message)
         except TimeoutError:
             if not timeout_armed:
                 # The clock starts only after the write, so this TimeoutError is the

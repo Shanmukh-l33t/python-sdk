@@ -7,7 +7,7 @@ from opentelemetry.trace import SpanKind, StatusCode
 from pydantic import ValidationError
 
 from mcp.server.context import CallNext, HandlerResult, ServerMiddleware, ServerRequestContext
-from mcp.shared._otel import extract_trace_context, otel_span
+from mcp.shared._otel import extract_trace_context, is_caller_error, otel_span
 from mcp.shared.exceptions import MCPError
 
 
@@ -44,14 +44,16 @@ class OpenTelemetryMiddleware(ServerMiddleware[Any]):
                 result = await call_next(ctx)
             except MCPError as e:
                 code = str(e.error.code)
-                span.set_attributes({"error.type": code, "rpc.response.status_code": code})
-                span.set_status(StatusCode.ERROR, e.error.message)
+                if is_caller_error(e.error.code):
+                    span.set_attribute("rpc.response.status_code", code)
+                else:
+                    span.set_attributes({"error.type": code, "rpc.response.status_code": code})
+                    span.set_status(StatusCode.ERROR, e.error.message)
                 raise
             except ValidationError:
                 # Mirror the sanitized wire response; pydantic messages carry client input.
-                code = str(INVALID_PARAMS)
-                span.set_attributes({"error.type": code, "rpc.response.status_code": code})
-                span.set_status(StatusCode.ERROR, "Invalid request parameters")
+                # `INVALID_PARAMS` is a caller error (`is_caller_error`): record the code only.
+                span.set_attribute("rpc.response.status_code", str(INVALID_PARAMS))
                 raise
             except Exception as e:
                 span.set_attribute("error.type", type(e).__qualname__)

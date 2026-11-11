@@ -19,6 +19,7 @@ from mcp.shared._httpx_utils import (
     sse_within_origin,
 )
 from mcp.shared.message import SessionMessage
+from mcp.shared.wire import deliver_local_error, serialize_outbound_message
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +134,14 @@ async def sse_client(
 
                         async def _send_message(session_message: SessionMessage) -> None:
                             logger.debug(f"Sending client message: {session_message}")
+                            # One unserializable message (e.g. a lone surrogate) must
+                            # not reach the wire encoder or end this writer: fail it
+                            # for whoever holds its id and continue (#3707).
+                            # Serialized here only to gate - the POST bodies are
+                            # built from model_dump.
+                            if serialize_outbound_message(session_message.message) is None:
+                                await deliver_local_error(session_message.message, read_stream_writer)
+                                return
                             response = await request_within_origin(
                                 client,
                                 "POST",

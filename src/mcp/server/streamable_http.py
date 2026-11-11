@@ -46,6 +46,7 @@ from mcp.shared._context_streams import ContextReceiveStream, ContextSendStream,
 from mcp.shared._stream_protocols import ReadStream, WriteStream
 from mcp.shared.inbound import MCP_PROTOCOL_VERSION_HEADER
 from mcp.shared.message import CloseSSEStreamCallback, ServerMessageMetadata, SessionMessage
+from mcp.shared.wire import deliver_local_error, serialize_outbound_message
 
 logger = logging.getLogger(__name__)
 
@@ -366,7 +367,7 @@ class StreamableHTTPServerTransport:
                 if priming_event is not None:
                     await sse_stream_writer.send(priming_event)
                 async for event_message in request_stream_reader:
-                    await sse_stream_writer.send(self._create_event_data(event_message))
+                    await self._send_event(sse_stream_writer, event_message)
                     if isinstance(event_message.message, JSONRPCResponse | JSONRPCError):
                         break
         except anyio.ClosedResourceError:  # pragma: lax no cover
@@ -420,8 +421,11 @@ class StreamableHTTPServerTransport:
         if self.mcp_session_id:
             response_headers[MCP_SESSION_ID_HEADER] = self.mcp_session_id
 
+        # serialize_outbound_message contains a serialization failure to its own
+        # message: a response becomes Internal server error for its id instead of
+        # killing the POST (#3707).
         return Response(
-            response_message.model_dump_json(by_alias=True, exclude_unset=True) if response_message else None,
+            serialize_outbound_message(response_message) if response_message else None,
             status_code=status_code,
             headers=response_headers,
         )
@@ -430,11 +434,19 @@ class StreamableHTTPServerTransport:
         """Extract the session ID from request headers."""
         return request.headers.get(MCP_SESSION_ID_HEADER)
 
-    def _create_event_data(self, event_message: EventMessage) -> SSEEvent:
-        """Create event data dictionary from an EventMessage."""
-        event_data = {
+    def _create_event_data(self, event_message: EventMessage) -> SSEEvent | None:
+        """Create event data dictionary from an EventMessage.
+
+        Returns `None` when the message cannot be serialized and must not go on
+        the wire; `_send_event` routes the failure locally instead (#3707).
+        """
+        data = serialize_outbound_message(event_message.message)
+        if data is None:
+            return None
+
+        event_data: SSEEvent = {
             "event": "message",
-            "data": event_message.message.model_dump_json(by_alias=True, exclude_unset=True),
+            "data": data,
         }
 
         # If an event ID was provided, include it
@@ -442,6 +454,21 @@ class StreamableHTTPServerTransport:
             event_data["id"] = event_message.event_id
 
         return event_data
+
+    async def _send_event(
+        self, sse_stream_writer: MemoryObjectSendStream[SSEEvent], event_message: EventMessage
+    ) -> None:
+        """Send one message as an SSE event; an unserializable one costs only itself.
+
+        The failure is delivered locally for whatever holds the message's id and
+        the stream keeps flowing (#3707).
+        """
+        event_data = self._create_event_data(event_message)
+        if event_data is None:
+            assert self._write_stream is not None  # an event implies connect() ran
+            await deliver_local_error(event_message.message, self._write_stream)
+            return
+        await sse_stream_writer.send(event_data)
 
     async def _terminate_unanswered_request(self, request_id: RequestId) -> None:
         """Terminate a request that settled without a response (e.g. cancelled).
@@ -794,8 +821,7 @@ class StreamableHTTPServerTransport:
                         # We should NOT receive JSONRPCResponse
 
                         # Send the message via SSE
-                        event_data = self._create_event_data(event_message)
-                        await sse_stream_writer.send(event_data)
+                        await self._send_event(sse_stream_writer, event_message)
             except anyio.ClosedResourceError:
                 # Session teardown can close the stream while the writer is between dequeues.
                 pass
@@ -957,8 +983,7 @@ class StreamableHTTPServerTransport:
                     async with sse_stream_writer:
                         # Define an async callback for sending events
                         async def send_event(event_message: EventMessage) -> None:
-                            event_data = self._create_event_data(event_message)
-                            await sse_stream_writer.send(event_data)
+                            await self._send_event(sse_stream_writer, event_message)
 
                         # Replay past events and get the stream ID
                         stream_id = await event_store.replay_events_after(last_event_id, send_event)
@@ -985,9 +1010,7 @@ class StreamableHTTPServerTransport:
                                 # Forward messages to SSE
                                 async with msg_reader:
                                     async for event_message in msg_reader:
-                                        event_data = self._create_event_data(event_message)
-
-                                        await sse_stream_writer.send(event_data)
+                                        await self._send_event(sse_stream_writer, event_message)
                             finally:
                                 self._sse_stream_writers.pop(stream_id, None)
                                 await self._clean_up_memory_streams(stream_id)

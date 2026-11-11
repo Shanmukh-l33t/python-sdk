@@ -30,7 +30,15 @@ import pytest
 import trio
 import trio.testing
 from anyio.streams.memory import MemoryObjectReceiveStream
-from mcp_types import CONNECTION_CLOSED, JSONRPCMessage, JSONRPCRequest, JSONRPCResponse
+from mcp_types import (
+    CONNECTION_CLOSED,
+    INTERNAL_ERROR,
+    ErrorData,
+    JSONRPCError,
+    JSONRPCMessage,
+    JSONRPCRequest,
+    JSONRPCResponse,
+)
 
 from mcp.client import stdio
 from mcp.client._transport import ReadStream
@@ -1456,3 +1464,33 @@ async def test_a_graceful_exit_with_a_surviving_child_leaks_no_pipe_fds(  # prag
         # Subset, not equality: other machinery may close fds, but never open new
         # ones; a leaked pipe fd would show up as an extra entry.
         assert set(os.listdir("/proc/self/fd")) <= baseline
+
+
+@pytest.mark.anyio
+async def test_a_surrogate_in_an_outbound_request_costs_only_that_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One unserializable outbound request is answered locally with an error for its
+    id; the writer keeps writing the messages after it (#3707)."""
+    bad = JSONRPCRequest(
+        jsonrpc="2.0",
+        id=1,
+        method="tools/call",
+        params={"name": "echo", "arguments": {"text": os.fsdecode(b"a\xffb")}},
+    )
+    good = JSONRPCRequest(jsonrpc="2.0", id=2, method="ping")
+    process = FakeProcess(on_stdin_close=lambda: process.exit(0))
+    install_fake_process(monkeypatch, process)
+
+    with anyio.fail_after(5):
+        async with stdio_client(FAKE_PARAMS) as (read_stream, write_stream):
+            await write_stream.send(SessionMessage(bad))
+            failed = await read_stream.receive()
+            await write_stream.send(SessionMessage(good))
+            # The zero-buffer handoff resumes this task before the writer has
+            # necessarily written; once all tasks block again, the write has landed.
+            await anyio.wait_all_tasks_blocked()
+            assert process.written == [_line(good)]
+
+    assert isinstance(failed, SessionMessage)
+    assert failed.message == JSONRPCError(
+        jsonrpc="2.0", id=1, error=ErrorData(code=INTERNAL_ERROR, message="Internal server error")
+    )

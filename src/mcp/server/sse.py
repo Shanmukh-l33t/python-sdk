@@ -59,6 +59,7 @@ from mcp.server.transport_security import (
 )
 from mcp.shared._context_streams import ContextSendStream, create_context_streams
 from mcp.shared.message import ServerMessageMetadata, SessionMessage
+from mcp.shared.wire import deliver_local_error, serialize_outbound_message
 
 logger = logging.getLogger(__name__)
 
@@ -184,10 +185,17 @@ class SseServerTransport:
 
                 async for session_message in write_stream_reader:
                     logger.debug(f"Sending message via SSE: {session_message}")
+                    json = serialize_outbound_message(session_message.message)
+                    if json is None:
+                        # One unserializable message (e.g. a lone surrogate) costs
+                        # only itself: fail it for whoever holds its id and keep
+                        # writing (#3707).
+                        await deliver_local_error(session_message.message, read_stream_writer)
+                        continue
                     await sse_stream_writer.send(
                         {
                             "event": "message",
-                            "data": session_message.message.model_dump_json(by_alias=True, exclude_unset=True),
+                            "data": json,
                         }
                     )
 

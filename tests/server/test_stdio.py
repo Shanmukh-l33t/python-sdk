@@ -13,9 +13,13 @@ import pytest
 from mcp_types import (
     CLIENT_CAPABILITIES_META_KEY,
     CLIENT_INFO_META_KEY,
+    INTERNAL_ERROR,
     PROTOCOL_VERSION_META_KEY,
     SERVER_INFO_META_KEY,
+    ErrorData,
+    JSONRPCError,
     JSONRPCMessage,
+    JSONRPCNotification,
     JSONRPCRequest,
     JSONRPCResponse,
     jsonrpc_message_adapter,
@@ -692,3 +696,106 @@ def test_mcpserver_run_stdio_serves_a_modern_connection(monkeypatch: pytest.Monk
     # resultType is modern-only: proves the request was served at the discovered version.
     assert responses[1].result["tools"] == []
     assert responses[1].result["resultType"] == "complete"
+
+
+# ---------------------------------------------------------------------------
+# Outbound serialization failures cost only their own message (#3707)
+# ---------------------------------------------------------------------------
+
+
+def _lone_surrogate() -> str:
+    """A str that cannot be UTF-8 encoded: the shape os.fsdecode() returns for a
+    non-UTF-8 file name (issue #3707's repro corpus)."""
+    return os.fsdecode(b"report-\xff.txt")
+
+
+def _internal_error_for(request_id: int) -> JSONRPCError:
+    return JSONRPCError(
+        jsonrpc="2.0", id=request_id, error=ErrorData(code=INTERNAL_ERROR, message="Internal server error")
+    )
+
+
+@pytest.mark.anyio
+async def test_a_surrogate_in_an_outbound_response_costs_only_that_message() -> None:
+    """One unserializable outbound response becomes Internal server error for its id;
+    the writer keeps writing the messages after it (#3707)."""
+    stdin = io.StringIO()
+    stdout = io.StringIO()
+    bad = JSONRPCResponse(jsonrpc="2.0", id=1, result={"text": _lone_surrogate()})
+    good = JSONRPCResponse(jsonrpc="2.0", id=2, result={"ok": True})
+
+    with anyio.fail_after(5):
+        async with stdio_server(stdin=anyio.AsyncFile(stdin), stdout=anyio.AsyncFile(stdout)) as (
+            read_stream,
+            write_stream,
+        ):
+            await write_stream.send(SessionMessage(bad))
+            await write_stream.send(SessionMessage(good))
+            await write_stream.aclose()
+            await read_stream.aclose()
+
+    stdout.seek(0)
+    lines = [line for line in stdout.readlines() if line.strip()]
+    assert [jsonrpc_message_adapter.validate_json(line.strip()) for line in lines] == [
+        _internal_error_for(1),
+        good,
+    ]
+
+
+@pytest.mark.anyio
+async def test_a_surrogate_in_an_outbound_notification_is_dropped_and_the_writer_continues() -> None:
+    """One unserializable outbound notification is dropped; the messages after it
+    still reach the wire (#3707)."""
+    stdin = io.StringIO()
+    stdout = io.StringIO()
+    bad = JSONRPCNotification(jsonrpc="2.0", method="notifications/message", params={"data": _lone_surrogate()})
+    good = JSONRPCResponse(jsonrpc="2.0", id=2, result={"ok": True})
+
+    with anyio.fail_after(5):
+        async with stdio_server(stdin=anyio.AsyncFile(stdin), stdout=anyio.AsyncFile(stdout)) as (
+            read_stream,
+            write_stream,
+        ):
+            await write_stream.send(SessionMessage(bad))
+            await write_stream.send(SessionMessage(good))
+            await write_stream.aclose()
+            await read_stream.aclose()
+
+    stdout.seek(0)
+    lines = [line for line in stdout.readlines() if line.strip()]
+    assert [jsonrpc_message_adapter.validate_json(line.strip()) for line in lines] == [good]
+
+
+@pytest.mark.anyio
+async def test_a_surrogate_in_an_outbound_server_request_fails_only_that_request() -> None:
+    """One unserializable server-initiated request (e.g. an elicitation) is answered
+    locally with an error for its id; nothing goes on the wire and the writer
+    continues (#3707)."""
+    # An open pipe with no data: stdin_reader parks in its first read instead of
+    # hitting EOF and closing the in-stream the local error must travel on.
+    in_r, in_w = os.pipe()
+    stdin_file = TextIOWrapper(open(in_r, "rb"), encoding="utf-8")
+    stdin = anyio.AsyncFile(stdin_file)
+    stdout = io.StringIO()
+    bad = JSONRPCRequest(jsonrpc="2.0", id=7, method="elicitation/create", params={"message": _lone_surrogate()})
+    good = JSONRPCResponse(jsonrpc="2.0", id=8, result={"ok": True})
+
+    try:
+        with anyio.fail_after(5):
+            async with stdio_server(stdin=stdin, stdout=anyio.AsyncFile(stdout)) as (read_stream, write_stream):
+                try:
+                    await write_stream.send(SessionMessage(bad))
+                    failed = await read_stream.receive()
+                    await write_stream.send(SessionMessage(good))
+                    await write_stream.aclose()
+                    await read_stream.aclose()
+                finally:
+                    os.close(in_w)
+    finally:
+        stdin_file.close()
+
+    assert isinstance(failed, SessionMessage)
+    assert failed.message == _internal_error_for(7)
+    stdout.seek(0)
+    lines = [line for line in stdout.readlines() if line.strip()]
+    assert [jsonrpc_message_adapter.validate_json(line.strip()) for line in lines] == [good]

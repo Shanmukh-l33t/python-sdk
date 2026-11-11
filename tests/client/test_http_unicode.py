@@ -4,6 +4,7 @@ Verifies that Unicode text is correctly transmitted and received in both directi
 (server→client and client→server) using the streamable HTTP transport.
 """
 
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -18,6 +19,7 @@ from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from mcp.server import Server, ServerRequestContext
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+from mcp.shared.exceptions import MCPError
 from tests.interaction.transports import StreamingASGITransport
 
 # The in-process app is mounted at this origin purely so URLs are well-formed; nothing listens here.
@@ -169,3 +171,117 @@ async def test_streamable_http_client_unicode_prompts() -> None:
         assert message.role == "user"
         assert message.content.type == "text"
         assert message.content.text == "Hello世界🌍Привет안녕مرحباשלום"
+
+
+# ---------------------------------------------------------------------------
+# Outbound serialization failures cost only their own message (#3707)
+# ---------------------------------------------------------------------------
+
+
+def _lone_surrogate() -> str:
+    """A str that cannot be UTF-8 encoded: the shape os.fsdecode() returns for a
+    non-UTF-8 file name (issue #3707's repro corpus)."""
+    return os.fsdecode(b"report-\xff.txt")
+
+
+async def _handle_surrogate_list_tools(
+    ctx: ServerRequestContext, params: types.PaginatedRequestParams | None
+) -> types.ListToolsResult:
+    return types.ListToolsResult(
+        tools=[
+            Tool(
+                name="bad_result",
+                description="returns a result that cannot be serialized",
+                input_schema={"type": "object"},
+            ),
+            Tool(
+                name="echo",
+                description="echoes its argument",
+                input_schema={"type": "object", "properties": {"text": {"type": "string"}}},
+            ),
+        ]
+    )
+
+
+async def _handle_surrogate_call_tool(
+    ctx: ServerRequestContext, params: types.CallToolRequestParams
+) -> types.CallToolResult:
+    if params.name == "bad_result":
+        return types.CallToolResult(content=[TextContent(type="text", text=_lone_surrogate())])
+    if params.name == "bad_log":
+        await ctx.session.send_log_message(  # pyright: ignore[reportDeprecated]
+            level="warning", data={"text": _lone_surrogate()}, related_request_id=ctx.request_id
+        )
+        return types.CallToolResult(content=[TextContent(type="text", text="logged")])
+    assert params.arguments is not None
+    return types.CallToolResult(content=[TextContent(type="text", text=f"Echo: {params.arguments['text']}")])
+
+
+@asynccontextmanager
+async def _surrogate_session() -> AsyncIterator[ClientSession]:
+    """Yield an initialized ClientSession speaking streamable HTTP (SSE responses) to a
+    server that can emit and echo lone surrogates, entirely in process."""
+    server = Server(
+        name="surrogate_test_server",
+        on_list_tools=_handle_surrogate_list_tools,
+        on_call_tool=_handle_surrogate_call_tool,
+    )
+    session_manager = StreamableHTTPSessionManager(app=server, json_response=False)
+    app = Starlette(routes=[Mount("/mcp", app=session_manager.handle_request)])
+
+    async with (
+        session_manager.run(),
+        httpx2.AsyncClient(transport=StreamingASGITransport(app), base_url=BASE_URL) as http_client,
+        streamable_http_client(f"{BASE_URL}/mcp", http_client=http_client) as (read_stream, write_stream),
+        ClientSession(read_stream, write_stream) as session,
+    ):
+        await session.initialize()
+        yield session
+
+
+@pytest.mark.anyio
+async def test_a_surrogate_in_a_tool_result_costs_only_that_call() -> None:
+    """A server->client result that cannot be serialized fails that one call with
+    Internal server error; the session keeps serving later calls (#3707)."""
+    async with _surrogate_session() as session:
+        with pytest.raises(MCPError) as exc_info:
+            await session.call_tool("bad_result", {}, read_timeout_seconds=5)
+        assert exc_info.value.error.code == types.INTERNAL_ERROR
+        assert exc_info.value.error.message == "Internal server error"
+
+        result = await session.call_tool("echo", {"text": "hi"}, read_timeout_seconds=5)
+        content = result.content[0]
+        assert content.type == "text"
+        assert content.text == "Echo: hi"
+
+
+@pytest.mark.anyio
+async def test_a_surrogate_in_a_tool_argument_costs_only_that_call() -> None:
+    """A client->server argument that cannot be serialized fails that one call with
+    Internal server error; the session keeps serving later calls (#3707)."""
+    async with _surrogate_session() as session:
+        with pytest.raises(MCPError) as exc_info:
+            await session.call_tool("echo", {"text": _lone_surrogate()}, read_timeout_seconds=5)
+        assert exc_info.value.error.code == types.INTERNAL_ERROR
+        assert exc_info.value.error.message == "Internal server error"
+
+        result = await session.call_tool("echo", {"text": "hi"}, read_timeout_seconds=5)
+        content = result.content[0]
+        assert content.type == "text"
+        assert content.text == "Echo: hi"
+
+
+@pytest.mark.anyio
+async def test_a_surrogate_in_a_log_notification_costs_only_that_message() -> None:
+    """A server->client notification that cannot be serialized is dropped; the
+    call it rode on still completes and later calls still work (#3707)."""
+    async with _surrogate_session() as session:
+        result = await session.call_tool("bad_log", {}, read_timeout_seconds=5)
+        content = result.content[0]
+        assert content.type == "text"
+        assert content.text == "logged"
+
+        result = await session.call_tool("echo", {"text": "hi"}, read_timeout_seconds=5)
+        content = result.content[0]
+        assert content.type == "text"
+        assert content.text == "Echo: hi"

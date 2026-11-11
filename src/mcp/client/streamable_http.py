@@ -43,6 +43,7 @@ from mcp.shared._httpx_utils import (
 from mcp.shared.inbound import MCP_PROTOCOL_VERSION_HEADER
 from mcp.shared.jsonrpc_dispatcher import cancelled_request_id_from_params
 from mcp.shared.message import ClientMessageMetadata, SessionMessage
+from mcp.shared.wire import deliver_local_error, serialize_outbound_message
 
 logger = logging.getLogger(__name__)
 
@@ -622,6 +623,14 @@ class StreamableHTTPTransport:
                 async def _handle_message(session_message: SessionMessage) -> None:
                     message = session_message.message
                     if self._consume_modern_cancellation(session_message):
+                        return
+
+                    # One unserializable message (e.g. a lone surrogate) must not
+                    # reach the wire encoder or end this writer: fail it for
+                    # whoever holds its id and continue (#3707). Serialized here
+                    # only to gate - the POST bodies are built from model_dump.
+                    if serialize_outbound_message(message) is None:
+                        await deliver_local_error(message, read_stream_writer)
                         return
                     metadata = (
                         session_message.metadata

@@ -27,6 +27,7 @@ import mcp_types as types
 from mcp.os.win32.utilities import rebind_std_handle_to_fd
 from mcp.shared._context_streams import create_context_streams
 from mcp.shared.message import SessionMessage
+from mcp.shared.wire import deliver_local_error, serialize_outbound_message
 
 if sys.platform != "win32":  # pragma: no branch
     import fcntl  # pragma: lax no cover - POSIX-only line, uncovered on Windows runners
@@ -200,7 +201,13 @@ async def stdio_server(stdin: anyio.AsyncFile[str] | None = None, stdout: anyio.
             try:
                 async with write_stream_reader:
                     async for session_message in write_stream_reader:
-                        json = session_message.message.model_dump_json(by_alias=True, exclude_unset=True)
+                        json = serialize_outbound_message(session_message.message)
+                        if json is None:
+                            # One unserializable message (e.g. a lone surrogate) costs
+                            # only itself: fail it for whoever holds its id and keep
+                            # writing (#3707).
+                            await deliver_local_error(session_message.message, read_stream_writer)
+                            continue
                         await stdout.write(json + "\n")
                         await stdout.flush()
             except anyio.ClosedResourceError:  # pragma: no cover

@@ -34,6 +34,7 @@ from mcp.os.win32.utilities import (
     terminate_windows_process_tree,
 )
 from mcp.shared.message import SessionMessage
+from mcp.shared.wire import deliver_local_error, serialize_outbound_message
 
 logger = logging.getLogger(__name__)
 
@@ -172,7 +173,13 @@ async def stdio_client(
         try:
             async with write_stream_reader:
                 async for session_message in write_stream_reader:
-                    json = session_message.message.model_dump_json(by_alias=True, exclude_unset=True)
+                    json = serialize_outbound_message(session_message.message)
+                    if json is None:
+                        # One unserializable message (e.g. a lone surrogate) costs
+                        # only itself: fail it for whoever holds its id and keep
+                        # writing (#3707).
+                        await deliver_local_error(session_message.message, read_stream_writer)
+                        continue
                     data = (json + "\n").encode(encoding=server.encoding, errors=server.encoding_error_handler)
                     await process.stdin.send(data)
         except (anyio.ClosedResourceError, anyio.BrokenResourceError, OSError):

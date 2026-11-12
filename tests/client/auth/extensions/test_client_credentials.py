@@ -370,6 +370,23 @@ def _provider_with_issuer(kind: str, storage: MockTokenStorage, audiences: list[
     )
 
 
+def _provider_without_issuer(kind: str, storage: MockTokenStorage) -> OAuthClientProvider:
+    """A ClientCredentials ("secret") or PrivateKeyJWT ("jwt") provider with no `issuer` configured.
+
+    Emits the `MCPDeprecationWarning`; callers wrap this call in `pytest.warns`.
+    """
+    if kind == "secret":
+        return ClientCredentialsOAuthProvider(
+            server_url=_SERVER_URL, storage=storage, client_id="cid", client_secret="csecret"
+        )
+    return PrivateKeyJWTOAuthProvider(
+        server_url=_SERVER_URL,
+        storage=storage,
+        client_id="cid",
+        assertion_provider=static_assertion_provider("signed-assertion"),
+    )
+
+
 async def _answer_discovery(
     flow: AsyncGenerator[httpx2.Request, httpx2.Response],
     *,
@@ -503,6 +520,54 @@ async def test_without_issuer_the_exchange_follows_whichever_server_was_discover
 
     assert (token_request.method, str(token_request.url)) == ("POST", "https://elsewhere.example.com/token")
     await flow.aclose()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("kind", ["secret", "jwt"])
+async def test_without_issuer_the_exchange_refuses_when_no_metadata_was_discovered(
+    mock_storage: MockTokenStorage, kind: str
+) -> None:
+    """#3850: with no `issuer` configured and discovery finding no authorization server metadata,
+    the client credential must not reach the 2025-03-26 default `/token` on the resource origin -
+    an endpoint no verified issuer vouches for. A resource that names an authorization server
+    which serves no metadata leaves exactly that hole."""
+    with pytest.warns(MCPDeprecationWarning, match="Omitting `issuer` is deprecated"):
+        provider = _provider_without_issuer(kind, mock_storage)
+    flow = provider.async_auth_flow(httpx2.Request("POST", _SERVER_URL))
+
+    with pytest.raises(OAuthFlowError) as exc_info:
+        await _answer_discovery(flow, authorization_server="https://elsewhere.example.com", metadata=None)
+
+    assert str(exc_info.value) == snapshot(
+        "No authorization server metadata discovered; with `issuer` unset, client credentials are not "
+        "sent to the unverified default `/token` endpoint"
+    )
+    await flow.aclose()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("kind", ["secret", "jwt"])
+async def test_without_issuer_the_exchange_refuses_metadata_for_an_unresolved_issuer(
+    mock_storage: MockTokenStorage, kind: str
+) -> None:
+    """Defense in depth behind the discovery-time check (#3850): with no `issuer` configured, the
+    exchange refuses metadata whose `issuer` names anywhere other than the authorization server
+    root the client resolved, so no token request carrying the credential is built from it."""
+    with pytest.warns(MCPDeprecationWarning, match="Omitting `issuer` is deprecated"):
+        provider = _provider_without_issuer(kind, mock_storage)
+    provider.context.auth_server_url = "https://good-as.example.com"
+    provider.context.oauth_metadata = OAuthMetadata.model_validate(_metadata_for("https://evil.example.com"))
+    provider.context.current_tokens = OAuthToken(access_token="held", token_type="Bearer", expires_in=3600)
+    provider.context.protocol_version = "2025-06-18"
+
+    with pytest.raises(OAuthFlowError) as exc_info:
+        await provider._perform_authorization()
+
+    assert str(exc_info.value) == snapshot(
+        "Authorization server metadata issuer mismatch: https://evil.example.com != https://good-as.example.com"
+    )
+    assert provider.context.oauth_metadata is None
+    assert provider.context.current_tokens is None
 
 
 def test_an_issuer_that_is_not_an_http_url_is_rejected_at_construction(mock_storage: MockTokenStorage) -> None:

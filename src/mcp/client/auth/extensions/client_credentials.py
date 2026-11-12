@@ -46,22 +46,36 @@ def _preferred_authorization_server(advertised: list[str], issuer: str | None) -
     )
 
 
-def _require_metadata_for_configured_issuer(context: OAuthContext, issuer: str | None) -> None:
-    """With an issuer configured, a token request is only built from metadata discovered for that issuer.
+def _require_verified_issuer_metadata(
+    context: OAuthContext, configured_issuer: str | None, resolved_issuer: str
+) -> None:
+    """A token request carries the client credential, so it is only built from authorization server
+    metadata for a verified issuer: the configured `issuer` when there is one, else (the deprecated
+    no-`issuer` window) the authorization server root the client resolved - the same root metadata
+    discovery already required the document's `issuer` to name (RFC 8414 section 3.3 / SEP-2468).
 
     Anything else held is dropped along with the tokens, so the next request starts discovery afresh
-    rather than refreshing against it.
+    rather than refreshing against it, and the flow stops instead of posting the credential to an
+    endpoint no verified issuer vouches for: the 2025-03-26 default `/token` on the resource origin
+    when discovery found no metadata, or metadata naming anywhere the client did not resolve.
     """
-    if issuer is None:
-        return
     metadata = context.oauth_metadata
-    if metadata is not None and issuers_match(str(metadata.issuer), issuer):
+    expected = configured_issuer if configured_issuer is not None else resolved_issuer
+    if metadata is not None and issuers_match(str(metadata.issuer), expected):
         return
     context.oauth_metadata = None
     context.clear_tokens()
     if metadata is None:
-        raise OAuthFlowError(f"No authorization server metadata discovered for configured issuer {issuer}")
-    raise OAuthFlowError(f"Authorization server metadata issuer mismatch: {metadata.issuer} != {issuer}")
+        raise OAuthFlowError(
+            "No authorization server metadata discovered"
+            + (
+                f" for configured issuer {configured_issuer}"
+                if configured_issuer is not None
+                else "; with `issuer` unset, client credentials are not sent to"
+                " the unverified default `/token` endpoint"
+            )
+        )
+    raise OAuthFlowError(f"Authorization server metadata issuer mismatch: {metadata.issuer} != {expected}")
 
 
 class ClientCredentialsOAuthProvider(OAuthClientProvider):
@@ -146,7 +160,7 @@ class ClientCredentialsOAuthProvider(OAuthClientProvider):
 
     async def _exchange_token_client_credentials(self) -> httpx2.Request:
         """Build token exchange request for client_credentials grant."""
-        _require_metadata_for_configured_issuer(self.context, self._issuer)
+        _require_verified_issuer_metadata(self.context, self._issuer, self._expected_issuer())
 
         token_data: dict[str, Any] = {
             "grant_type": "client_credentials",
@@ -395,7 +409,7 @@ class PrivateKeyJWTOAuthProvider(OAuthClientProvider):
 
     async def _exchange_token_client_credentials(self) -> httpx2.Request:
         """Build token exchange request for client_credentials grant with private_key_jwt."""
-        _require_metadata_for_configured_issuer(self.context, self._issuer)
+        _require_verified_issuer_metadata(self.context, self._issuer, self._expected_issuer())
 
         token_data: dict[str, Any] = {
             "grant_type": "client_credentials",

@@ -65,13 +65,14 @@ def get_windows_executable_command(command: str) -> str:
     """Resolves the command to a Windows executable path.
 
     Tries the bare name first, then the common script extensions (.cmd, .bat,
-    .exe, .ps1).
+    .exe).
     """
     try:
         if command_path := shutil.which(command):
             return command_path
 
-        for ext in [".cmd", ".bat", ".exe", ".ps1"]:
+        # No .ps1: absent from PATHEXT, and spawning one directly raises WinError 193.
+        for ext in [".cmd", ".bat", ".exe"]:
             ext_version = f"{command}{ext}"
             if ext_path := shutil.which(ext_version):
                 return ext_path

@@ -1,6 +1,7 @@
 """Test the elicitation feature over the in-memory client transport."""
 
 from typing import Any, Literal
+from unittest.mock import AsyncMock, MagicMock
 
 import mcp_types as types
 import pytest
@@ -10,6 +11,7 @@ from pydantic import BaseModel, Field
 from mcp import Client
 from mcp.client import ClientRequestContext
 from mcp.client.session import ElicitationFnT
+from mcp.server.context import ServerRequestContext
 from mcp.server.mcpserver import Context, MCPServer
 
 
@@ -403,3 +405,35 @@ async def test_elicitation_literal_field_renders_as_a_spec_enum_schema():
         return ElicitResult(action="accept", content={"size": "m", "extras": ["a"]})
 
     await call_tool_and_assert(mcp, callback, "pick", {}, "m:a")
+
+
+def _context_with_request_id(request_id: str | int | None) -> tuple[Context[Any, Any], AsyncMock]:
+    session = AsyncMock()
+    session.elicit_form = AsyncMock(return_value=ElicitResult(action="cancel"))
+    request_context = ServerRequestContext(
+        request_id=request_id,
+        session=session,
+        method="tools/call",
+        lifespan_context=None,
+        protocol_version="2025-11-25",
+    )
+    return Context(request_context=request_context, mcp_server=MagicMock()), session
+
+
+@pytest.mark.anyio
+async def test_elicitation_passes_an_integer_request_id_through_unchanged():
+    """A JSON-RPC id of 42 correlates as 42, not "42" (issue #3876)."""
+    ctx, session = _context_with_request_id(42)
+
+    assert ctx.request_id == 42
+    await ctx.elicit("Proceed?", AnswerSchema)
+
+    assert session.elicit_form.await_args is not None
+    assert session.elicit_form.await_args.kwargs["related_request_id"] == 42
+
+
+def test_request_id_is_none_when_the_request_has_no_id():
+    """A request-less id stays None instead of becoming the string "None" (issue #3876)."""
+    ctx, _ = _context_with_request_id(None)
+
+    assert ctx.request_id is None

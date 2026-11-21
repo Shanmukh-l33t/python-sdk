@@ -1,5 +1,6 @@
 """Test the elicitation feature over the in-memory client transport."""
 
+from enum import Enum, StrEnum
 from typing import Any, Literal
 
 import mcp_types as types
@@ -403,3 +404,57 @@ async def test_elicitation_literal_field_renders_as_a_spec_enum_schema():
         return ElicitResult(action="accept", content={"size": "m", "extras": ["a"]})
 
     await call_tool_and_assert(mcp, callback, "pick", {}, "m:a")
+
+
+@pytest.mark.anyio
+async def test_elicitation_string_enum_fields_render_as_spec_enum_schemas():
+    """`StrEnum` and `(str, Enum)` fields render inline like `Literal`, with no `$defs`/`$ref`."""
+    mcp = MCPServer(name="StringEnumServer")
+
+    class Color(StrEnum):
+        RED = "red"
+        BLUE = "blue"
+
+    class OldColor(str, Enum):  # noqa: UP042  the `(str, Enum)` spelling is what the issue reports
+        RED = "red"
+        BLUE = "blue"
+
+    class EnumSchema(BaseModel):
+        color: Color = Field(description="Color")
+        old_color: OldColor | None = None
+        colors: list[Color] = Field(description="Colors")
+
+    @mcp.tool(description="Enum selection")
+    async def pick(ctx: Context) -> str:
+        result = await ctx.elicit(message="Pick", schema=EnumSchema)
+        if result.action == "accept" and result.data:
+            return f"{result.data.color}:{','.join(result.data.colors)}"
+        raise NotImplementedError
+
+    async def callback(context: ClientRequestContext, params: ElicitRequestParams):
+        assert isinstance(params, types.ElicitRequestFormParams)
+        props = params.requested_schema["properties"]
+        assert props["color"] == {"enum": ["red", "blue"], "title": "Color", "type": "string", "description": "Color"}
+        assert props["old_color"] == {"enum": ["red", "blue"], "title": "OldColor", "type": "string"}
+        assert props["colors"]["items"] == {"enum": ["red", "blue"], "title": "Color", "type": "string"}
+        return ElicitResult(action="accept", content={"color": "red", "colors": ["blue"]})
+
+    await call_tool_and_assert(mcp, callback, "pick", {}, "red:blue")
+
+    # A non-string enum is still not a spec enum schema and stays rejected.
+    class Rank(Enum):
+        ONE = 1
+        TWO = 2
+
+    class RankSchema(BaseModel):
+        rank: Rank
+
+    @mcp.tool(description="Int enum selection")
+    async def pick_rank(ctx: Context) -> str:
+        try:
+            await ctx.elicit(message="Rank", schema=RankSchema)
+        except TypeError as e:
+            return f"Validation failed: {str(e)}"
+        raise NotImplementedError
+
+    await call_tool_and_assert(mcp, callback, "pick_rank", {}, text_contains=["Validation failed:", "rank"])

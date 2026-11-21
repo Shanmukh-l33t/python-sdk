@@ -72,6 +72,31 @@ class _ElicitationJsonSchema(GenerateJsonSchema):
         return result
 
 
+def _inline_string_enums(json_schema: dict[str, Any]) -> None:
+    """Inline the `$defs` pydantic hoists string enums into; the spec accepts no `$ref`."""
+    defs: dict[str, Any] = json_schema.get("$defs", {})
+    enums: dict[str, Any] = {
+        name: spec for name, spec in defs.items() if spec.get("type") == "string" and "enum" in spec
+    }
+
+    def inline(prop: dict[str, Any]) -> dict[str, Any]:
+        name = prop.get("$ref", "").removeprefix("#/$defs/")
+        if name in enums:
+            return {**enums[name], **{k: v for k, v in prop.items() if k != "$ref"}}
+        items: dict[str, Any] | None = prop.get("items")
+        if items is not None and "$ref" in items:
+            return {**prop, "items": inline(items)}
+        return prop
+
+    properties: dict[str, dict[str, Any]] = json_schema.get("properties", {})
+    for name, prop in properties.items():
+        properties[name] = inline(prop)
+    for name in enums:
+        defs.pop(name)
+    if not defs:
+        json_schema.pop("$defs", None)
+
+
 def _validate_rendered_properties(json_schema: dict[str, Any]) -> None:
     """Reject any `properties` entry the spec's `PrimitiveSchemaDefinition` won't accept.
 
@@ -96,6 +121,7 @@ def render_elicitation_schema(schema: type[BaseModel]) -> dict[str, Any]:
             `PrimitiveSchemaDefinition` does not accept.
     """
     json_schema = schema.model_json_schema(schema_generator=_ElicitationJsonSchema)
+    _inline_string_enums(json_schema)
     _validate_rendered_properties(json_schema)
     return json_schema
 

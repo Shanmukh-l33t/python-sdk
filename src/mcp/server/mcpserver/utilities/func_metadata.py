@@ -3,8 +3,14 @@ import inspect
 import json
 import sys
 from collections.abc import Awaitable, Callable, Sequence
+from datetime import date, datetime, time, timedelta
+from decimal import Decimal
+from enum import Enum
+from ipaddress import IPv4Address, IPv4Interface, IPv4Network, IPv6Address, IPv6Interface, IPv6Network
 from itertools import chain
+from pathlib import PurePath
 from typing import Annotated, Any, NotRequired, Union, cast, get_args, get_origin
+from uuid import UUID
 
 import anyio
 import anyio.to_thread
@@ -46,6 +52,24 @@ def _is_input_required_type(obj: Any) -> bool:
 _CONTENT_TYPES = (*get_args(ContentBlock), Image, Audio)
 # `_convert_to_content` unrolls list/tuple values; a `Sequence[...]` annotation is one of those at runtime.
 _CONTENT_SEQUENCE_ORIGINS = (list, tuple, Sequence)
+
+# Scalar types pydantic serializes on its own, unlike an ordinary class (whose fields become the output model).
+_PYDANTIC_SCALAR_TYPES = (
+    Enum,
+    UUID,
+    date,
+    datetime,
+    time,
+    timedelta,
+    Decimal,
+    PurePath,
+    IPv4Address,
+    IPv6Address,
+    IPv4Interface,
+    IPv6Interface,
+    IPv4Network,
+    IPv6Network,
+)
 
 
 def _returns_content(annotation: Any) -> bool:
@@ -313,7 +337,8 @@ def func_metadata(
             If structured, creates a Pydantic model for the function's result based on its annotation.
             Supports various return types:
             - BaseModel subclasses (used directly)
-            - Primitive types (str, int, float, bool, bytes, None) - wrapped in a
+            - Primitive types (str, int, float, bool, bytes, None) and the scalars pydantic serializes
+                (Enum, UUID, datetime, date, time, timedelta, Decimal, Path, ipaddress) - wrapped in a
                 model with a 'result' field
             - TypedDict - used directly
             - Dataclasses and other annotated classes - converted to Pydantic models
@@ -545,8 +570,13 @@ def _create_output_model(original_annotation: Any, type_expr: Any, func_name: st
         elif type_annotation is dict:
             model = dict[str, Any]
 
-        # Case 4: Primitive types and bare collections that need wrapping
-        elif type_annotation in (str, int, float, bool, bytes, type(None), list, tuple, set, frozenset):
+        # Case 4: Primitive types, bare collections, and pydantic scalars (`AnyUrl` and other types that bring
+        # their own core schema) need wrapping
+        elif (
+            type_annotation in (str, int, float, bool, bytes, type(None), list, tuple, set, frozenset)
+            or issubclass(type_annotation, _PYDANTIC_SCALAR_TYPES)
+            or hasattr(type_annotation, "__get_pydantic_core_schema__")
+        ):
             model = _create_wrapped_model(func_name, original_annotation)
             wrap_output = True
 

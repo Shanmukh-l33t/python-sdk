@@ -5,17 +5,23 @@
 # pyright: reportUnknownLambdaType=false
 # pyright: reportMissingTypeArgument=false
 # pyright: reportUnknownVariableType=false
+import decimal
+import ipaddress
 import typing
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import date, datetime, time, timedelta
+from enum import IntEnum, StrEnum
+from pathlib import Path, PurePath
 from typing import TYPE_CHECKING, Annotated, Any, Final, NamedTuple, NotRequired, Required, TypedDict
+from uuid import UUID
 
 import annotated_types
 import pytest
 from dirty_equals import IsPartialDict
 from inline_snapshot import snapshot
 from mcp_types import CallToolResult, ContentBlock, EmbeddedResource, InputRequiredResult, TextContent
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import AnyHttpUrl, AnyUrl, BaseModel, Field, ValidationError
 from typing_extensions import ReadOnly
 
 from mcp import MCPDeprecationWarning
@@ -1136,6 +1142,113 @@ def test_a_bare_set_is_wrapped(tool: Callable[..., Any]):
             structured_content={"result": [1]},
         )
     )
+
+
+class _Color(StrEnum):
+    RED = "red"
+    BLUE = "blue"
+
+
+class _Level(IntEnum):
+    LOW = 1
+    HIGH = 2
+
+
+def _returns_str_enum() -> _Color:
+    return _Color.RED
+
+
+def _returns_int_enum() -> _Level:
+    return _Level.HIGH
+
+
+def _returns_uuid() -> UUID:
+    return UUID("12345678-1234-5678-1234-567812345678")
+
+
+def _returns_datetime() -> datetime:
+    return datetime(2026, 11, 21, 5, 35, 35)
+
+
+def _returns_date() -> date:
+    return date(2026, 11, 21)
+
+
+def _returns_time() -> time:
+    return time(5, 35, 35)
+
+
+def _returns_timedelta() -> timedelta:
+    return timedelta(minutes=1, seconds=30)
+
+
+def _returns_decimal() -> decimal.Decimal:
+    return decimal.Decimal("1.50")
+
+
+def _returns_path() -> Path:
+    return Path("/tmp/report.json")
+
+
+def _returns_pure_path() -> PurePath:
+    return PurePath("/tmp/report.json")
+
+
+def _returns_ipv4_address() -> ipaddress.IPv4Address:
+    return ipaddress.IPv4Address("192.0.2.1")
+
+
+def _returns_ipv4_network() -> ipaddress.IPv4Network:
+    return ipaddress.IPv4Network("192.0.2.0/24")
+
+
+def _returns_any_url() -> AnyUrl:
+    return AnyUrl("https://example.com/")
+
+
+def _returns_any_http_url() -> AnyHttpUrl:
+    return AnyHttpUrl("https://example.com/")
+
+
+@pytest.mark.parametrize(
+    ("tool", "expected"),
+    [
+        (_returns_str_enum, "red"),
+        (_returns_int_enum, 2),
+        (_returns_uuid, "12345678-1234-5678-1234-567812345678"),
+        (_returns_datetime, "2026-11-21T05:35:35"),
+        (_returns_date, "2026-11-21"),
+        (_returns_time, "05:35:35"),
+        (_returns_timedelta, "PT1M30S"),
+        (_returns_decimal, "1.50"),
+        (_returns_path, "/tmp/report.json"),
+        (_returns_pure_path, "/tmp/report.json"),
+        (_returns_ipv4_address, "192.0.2.1"),
+        (_returns_ipv4_network, "192.0.2.0/24"),
+        (_returns_any_url, "https://example.com/"),
+        (_returns_any_http_url, "https://example.com/"),
+    ],
+)
+def test_pydantic_serializable_scalar_returns_are_wrapped(tool: Callable[..., Any], expected: Any):
+    """SDK-defined: pydantic serializes these scalars itself, so they are wrapped like `str` and keep their value
+    under `structured_content["result"]` instead of dropping structured output."""
+    meta = func_metadata(tool)
+
+    assert meta.output_schema is not None
+    assert meta.output_schema["type"] == "object"
+    assert list(meta.output_schema["properties"]) == ["result"]
+    result = meta.convert_result(tool())
+    assert isinstance(result, CallToolResult)
+    assert result.structured_content == {"result": expected}
+
+
+def test_a_url_return_annotation_keeps_the_url_in_its_schema():
+    """A `__get_pydantic_core_schema__` type is not an ordinary class: its own schema is published, not an empty
+    one built from its private annotations."""
+    meta = func_metadata(_returns_any_http_url)
+
+    assert meta.output_schema is not None
+    assert meta.output_schema["properties"]["result"] == snapshot({"format": "uri", "minLength": 1, "type": "string"})
 
 
 class _Report(BaseModel):
